@@ -1,38 +1,17 @@
-import os, sys
+import sys
 
-from admin import (
-    _version,
-    ensure_daemon,
-    list_cloud_profiles,
-    list_local_profiles,
-    print_update_banner,
-    restart_daemon,
-    run_doctor,
-    run_setup,
-    run_update,
-    start_remote_daemon,
-    stop_remote_daemon,
-    sync_local_profile,
-)
-from helpers import *
+from helpers import *  # noqa: F401,F403  (helpers pre-imported for -c snippets)
 
-HELP = """Browser Harness
+HELP = """API Harness
 
-Read SKILL.md for the default workflow and examples.
+Read SKILL.md for the default workflow. Read helpers.py for the functions.
+For setup, env vars, or debugging, read install.md.
 
 Typical usage:
-  uv run bh <<'PY'
-  ensure_real_tab()
-  print(page_info())
-  PY
+  api-harness -c "print(get('https://api.github.com/zen'))"
+  api-harness -c "store('issues', get('https://api.github.com/repos/python/cpython/issues')); print(q('SELECT count(*) AS n FROM issues'))"
 
-Helpers are pre-imported. The daemon auto-starts and connects to the running browser.
-
-Commands:
-  browser-harness --version        print the installed version
-  browser-harness --doctor         diagnose install, daemon, and browser state
-  browser-harness --setup          interactively attach to your running browser
-  browser-harness --update [-y]    pull the latest version (agents: pass -y)
+Helpers are pre-imported (request/get/post/put/delete, paginate, db/store/q, read_docs/read_sdk).
 """
 
 
@@ -41,23 +20,8 @@ def main():
     if args and args[0] in {"-h", "--help"}:
         print(HELP)
         return
-    if args and args[0] == "--version":
-        print(_version() or "unknown")
-        return
-    if args and args[0] == "--doctor":
-        sys.exit(run_doctor())
-    if args and args[0] == "--setup":
-        sys.exit(run_setup())
-    if args and args[0] == "--update":
-        yes = any(a in {"-y", "--yes"} for a in args[1:])
-        sys.exit(run_update(yes=yes))
-    if args and args[0] == "--debug-clicks":
-        os.environ["BH_DEBUG_CLICKS"] = "1"
-        args = args[1:]
     if not args or args[0] != "-c":
-        sys.exit("Usage: browser-harness -c \"print(page_info())\"")
-    print_update_banner()
-    ensure_daemon()
+        sys.exit('Usage: api-harness -c "print(get(\'https://api.github.com/zen\'))"')
     exec(args[1], globals())
 
 

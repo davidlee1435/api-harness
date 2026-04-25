@@ -1,8 +1,28 @@
-"""Browser control via CDP. Read, edit, extend -- this file is yours."""
-import base64, json, os, socket, time, urllib.request
-from pathlib import Path
-from urllib.parse import urlparse
+"""Read, edit, extend -- this file is yours.
 
+The agent's job: read API docs or an SDK, write the calls it needs *here*,
+land the response into SQLite via `store()`, then query with `q()`.
+
+Three layers, all editable:
+  - HTTP:    request / get / post / put / delete   (urllib, stdlib only)
+  - Storage: db / store / q                        (sqlite3, stdlib only)
+  - Ingest:  read_docs / read_sdk                  (filesystem walkers)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Iterable
+
+
+# --- env ---
 
 def _load_env():
     p = Path(__file__).parent / ".env"
@@ -18,234 +38,259 @@ def _load_env():
 
 _load_env()
 
-NAME = os.environ.get("BU_NAME", "default")
-SOCK = f"/tmp/bu-{NAME}.sock"
-INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
+
+# --- HTTP ---
+
+class HTTPError(Exception):
+    def __init__(self, status: int, url: str, body: str):
+        super().__init__(f"{status} {url}: {body[:200]}")
+        self.status = status
+        self.url = url
+        self.body = body
 
 
-def _send(req):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(SOCK)
-    s.sendall((json.dumps(req) + "\n").encode())
-    data = b""
-    while not data.endswith(b"\n"):
-        chunk = s.recv(1 << 20)
-        if not chunk: break
-        data += chunk
-    s.close()
-    r = json.loads(data)
-    if "error" in r: raise RuntimeError(r["error"])
-    return r
+def request(
+    method: str,
+    url: str,
+    *,
+    params: dict | None = None,
+    headers: dict | None = None,
+    json_body: Any = None,
+    data: bytes | str | None = None,
+    timeout: float = 30.0,
+    retries: int = 3,
+    backoff: float = 0.5,
+) -> dict | list | str:
+    """One HTTP call with retries on 429/5xx and transient network errors.
 
+    Returns parsed JSON when the response is JSON, else the decoded body string.
+    Raises HTTPError on non-retryable 4xx, or after retries are exhausted."""
+    if params:
+        sep = "&" if "?" in url else "?"
+        url = url + sep + urllib.parse.urlencode(params, doseq=True)
 
-def cdp(method, session_id=None, **params):
-    """Raw CDP. cdp('Page.navigate', url='...'), cdp('DOM.getDocument', depth=-1)."""
-    return _send({"method": method, "params": params, "session_id": session_id}).get("result", {})
+    body: bytes | None = None
+    h = dict(headers or {})
+    if json_body is not None:
+        body = json.dumps(json_body).encode()
+        h.setdefault("Content-Type", "application/json")
+    elif isinstance(data, str):
+        body = data.encode()
+    elif isinstance(data, (bytes, bytearray)):
+        body = bytes(data)
 
-
-def drain_events():  return _send({"meta": "drain_events"})["events"]
-
-
-# --- navigation / page ---
-def goto_url(url):
-    r = cdp("Page.navigate", url=url)
-    d = (Path(__file__).parent / "domain-skills" / (urlparse(url).hostname or "").removeprefix("www.").split(".")[0])
-    return {**r, "domain_skills": sorted(p.name for p in d.rglob("*.md"))[:10]} if d.is_dir() else r
-
-def page_info():
-    """{url, title, w, h, sx, sy, pw, ph} — viewport + scroll + page size.
-
-    If a native dialog (alert/confirm/prompt/beforeunload) is open, returns
-    {dialog: {type, message, ...}} instead — the page's JS thread is frozen
-    until the dialog is handled (see interaction-skills/dialogs.md)."""
-    dialog = _send({"meta": "pending_dialog"}).get("dialog")
-    if dialog:
-        return {"dialog": dialog}
-    r = cdp("Runtime.evaluate",
-            expression="JSON.stringify({url:location.href,title:document.title,w:innerWidth,h:innerHeight,sx:scrollX,sy:scrollY,pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})",
-            returnByValue=True)
-    return json.loads(r["result"]["value"])
-
-# --- input ---
-_debug_click_counter = 0
-
-def click_at_xy(x, y, button="left", clicks=1):
-    if os.environ.get("BH_DEBUG_CLICKS"):
-        global _debug_click_counter
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=body, method=method.upper(), headers=h)
         try:
-            from PIL import Image, ImageDraw
-            dpr = js("window.devicePixelRatio") or 1
-            path = capture_screenshot(f"/tmp/debug_click_{_debug_click_counter}.png")
-            img = Image.open(path)
-            draw = ImageDraw.Draw(img)
-            px, py = int(x * dpr), int(y * dpr)
-            r = int(15 * dpr)
-            draw.ellipse([px - r, py - r, px + r, py + r], outline="red", width=int(3 * dpr))
-            draw.line([px - r - int(5 * dpr), py, px + r + int(5 * dpr), py], fill="red", width=int(2 * dpr))
-            draw.line([px, py - r - int(5 * dpr), px, py + r + int(5 * dpr)], fill="red", width=int(2 * dpr))
-            img.save(path)
-            print(f"[debug_click] saved {path} (x={x}, y={y}, dpr={dpr})")
-        except Exception as e:
-            print(f"[debug_click] overlay failed: {e}")
-        _debug_click_counter += 1
-    cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button=button, clickCount=clicks)
-    cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button=button, clickCount=clicks)
-
-def type_text(text):
-    cdp("Input.insertText", text=text)
-
-_KEYS = {  # key → (windowsVirtualKeyCode, code, text)
-    "Enter": (13, "Enter", "\r"), "Tab": (9, "Tab", "\t"), "Backspace": (8, "Backspace", ""),
-    "Escape": (27, "Escape", ""), "Delete": (46, "Delete", ""), " ": (32, "Space", " "),
-    "ArrowLeft": (37, "ArrowLeft", ""), "ArrowUp": (38, "ArrowUp", ""),
-    "ArrowRight": (39, "ArrowRight", ""), "ArrowDown": (40, "ArrowDown", ""),
-    "Home": (36, "Home", ""), "End": (35, "End", ""),
-    "PageUp": (33, "PageUp", ""), "PageDown": (34, "PageDown", ""),
-}
-def press_key(key, modifiers=0):
-    """Modifiers bitfield: 1=Alt, 2=Ctrl, 4=Meta(Cmd), 8=Shift.
-    Special keys (Enter, Tab, Arrow*, Backspace, etc.) carry their virtual key codes
-    so listeners checking e.keyCode / e.key all fire."""
-    vk, code, text = _KEYS.get(key, (ord(key[0]) if len(key) == 1 else 0, key, key if len(key) == 1 else ""))
-    base = {"key": key, "code": code, "modifiers": modifiers, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
-    cdp("Input.dispatchKeyEvent", type="keyDown", **base, **({"text": text} if text else {}))
-    if text and len(text) == 1:
-        cdp("Input.dispatchKeyEvent", type="char", text=text, **{k: v for k, v in base.items() if k != "text"})
-    cdp("Input.dispatchKeyEvent", type="keyUp", **base)
-
-def scroll(x, y, dy=-300, dx=0):
-    cdp("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y, deltaX=dx, deltaY=dy)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode(resp.headers.get_content_charset() or "utf-8", "replace")
+                ct = resp.headers.get("Content-Type", "")
+                if "json" in ct or (raw.startswith(("{", "[")) and raw.endswith(("}", "]"))):
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError:
+                        return raw
+                return raw
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace") if e.fp else ""
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
+                _sleep_for_retry(e.headers.get("Retry-After"), attempt, backoff)
+                last_err = e
+                continue
+            raise HTTPError(e.code, url, raw) from None
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < retries:
+                time.sleep(backoff * (2 ** attempt))
+                last_err = e
+                continue
+            raise
+    raise last_err  # type: ignore[misc]
 
 
-# --- visual ---
-def capture_screenshot(path="/tmp/shot.png", full=False):
-    r = cdp("Page.captureScreenshot", format="png", captureBeyondViewport=full)
-    open(path, "wb").write(base64.b64decode(r["data"]))
-    return path
-
-
-# --- tabs ---
-def list_tabs(include_chrome=True):
-    out = []
-    for t in cdp("Target.getTargets")["targetInfos"]:
-        if t["type"] != "page": continue
-        url = t.get("url", "")
-        if not include_chrome and url.startswith(INTERNAL): continue
-        out.append({"targetId": t["targetId"], "title": t.get("title", ""), "url": url})
-    return out
-
-def current_tab():
-    t = cdp("Target.getTargetInfo").get("targetInfo", {})
-    return {"targetId": t.get("targetId"), "url": t.get("url", ""), "title": t.get("title", "")}
-
-def _mark_tab():
-    """Prepend 🟢 to tab title so the user can see which tab the agent controls."""
-    try: cdp("Runtime.evaluate", expression="if(!document.title.startsWith('\U0001F7E2'))document.title='\U0001F7E2 '+document.title")
-    except Exception: pass
-
-def switch_tab(target_id):
-    # Unmark old tab
-    try: cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F7E2 '))document.title=document.title.slice(2)")
-    except Exception: pass
-    cdp("Target.activateTarget", targetId=target_id)
-    sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
-    _send({"meta": "set_session", "session_id": sid})
-    _mark_tab()
-    return sid
-
-def new_tab(url="about:blank"):
-    # Always create blank, then goto: passing url to createTarget races with
-    # attach, so the brief about:blank is "complete" by the time the caller
-    # polls and wait_for_load() returns before navigation actually starts.
-    tid = cdp("Target.createTarget", url="about:blank")["targetId"]
-    switch_tab(tid)
-    if url != "about:blank":
-        goto_url(url)
-    return tid
-
-def ensure_real_tab():
-    """Switch to a real user tab if current is chrome:// / internal / stale."""
-    tabs = list_tabs(include_chrome=False)
-    if not tabs:
-        return None
-    try:
-        cur = current_tab()
-        if cur["url"] and not cur["url"].startswith(INTERNAL):
-            return cur
-    except Exception:
-        pass
-    switch_tab(tabs[0]["targetId"])
-    return tabs[0]
-
-def iframe_target(url_substr):
-    """First iframe target whose URL contains `url_substr`. Use with js(..., target_id=...)."""
-    for t in cdp("Target.getTargets")["targetInfos"]:
-        if t["type"] == "iframe" and url_substr in t.get("url", ""):
-            return t["targetId"]
-    return None
-
-
-# --- utility ---
-def wait(seconds=1.0):
-    time.sleep(seconds)
-
-def wait_for_load(timeout=15.0):
-    """Poll document.readyState == 'complete' or timeout."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if js("document.readyState") == "complete": return True
-        time.sleep(0.3)
-    return False
-
-def js(expression, target_id=None):
-    """Run JS in the attached tab (default) or inside an iframe target (via iframe_target()).
-
-    Expressions with top-level `return` are automatically wrapped in an IIFE, so both
-    `document.title` and `const x = 1; return x` are valid inputs.
-    """
-    sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"] if target_id else None
-    if "return " in expression:
-        expression = f"(function(){{{expression}}})()"
-    r = cdp("Runtime.evaluate", session_id=sid, expression=expression, returnByValue=True, awaitPromise=True)
-    return r.get("result", {}).get("value")
-
-
-_KC = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, " ": 32, "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40}
-
-
-def dispatch_key(selector, key="Enter", event="keypress"):
-    """Dispatch a DOM KeyboardEvent on the matched element.
-
-    Use this when a site reacts to synthetic DOM key events on an element more reliably
-    than to raw CDP input events.
-    """
-    kc = _KC.get(key, ord(key) if len(key) == 1 else 0)
-    js(
-        f"(()=>{{const e=document.querySelector({json.dumps(selector)});if(e){{e.focus();e.dispatchEvent(new KeyboardEvent({json.dumps(event)},{{key:{json.dumps(key)},code:{json.dumps(key)},keyCode:{kc},which:{kc},bubbles:true}}));}}}})()"
-    )
-
-def upload_file(selector, path):
-    """Set files on a file input via CDP DOM.setFileInputFiles. `path` is an absolute filepath (use tempfile.mkstemp if needed)."""
-    doc = cdp("DOM.getDocument", depth=-1)
-    nid = cdp("DOM.querySelector", nodeId=doc["root"]["nodeId"], selector=selector)["nodeId"]
-    if not nid: raise RuntimeError(f"no element for {selector}")
-    cdp("DOM.setFileInputFiles", files=[path] if isinstance(path, str) else list(path), nodeId=nid)
-
-def http_get(url, headers=None, timeout=20.0):
-    """Pure HTTP — no browser. Use for static pages / APIs. Wrap in ThreadPoolExecutor for bulk.
-
-    When BROWSER_USE_API_KEY is set, routes through the fetch-use proxy (handles bot
-    detection, residential proxies, retries). Falls back to local urllib otherwise."""
-    if os.environ.get("BROWSER_USE_API_KEY"):
+def _sleep_for_retry(retry_after: str | None, attempt: int, backoff: float) -> None:
+    if retry_after:
         try:
-            from fetch_use import fetch_sync
-            return fetch_sync(url, headers=headers, timeout_ms=int(timeout * 1000)).text
-        except ImportError:
+            time.sleep(float(retry_after))
+            return
+        except ValueError:
             pass
-    import gzip
-    h = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
-    if headers: h.update(headers)
-    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
-        data = r.read()
-        if r.headers.get("Content-Encoding") == "gzip": data = gzip.decompress(data)
-        return data.decode()
+    time.sleep(backoff * (2 ** attempt))
+
+
+def get(url: str, **kw) -> Any:
+    return request("GET", url, **kw)
+
+
+def post(url: str, **kw) -> Any:
+    return request("POST", url, **kw)
+
+
+def put(url: str, **kw) -> Any:
+    return request("PUT", url, **kw)
+
+
+def delete(url: str, **kw) -> Any:
+    return request("DELETE", url, **kw)
+
+
+def paginate(
+    url: str,
+    *,
+    next_key: str | None = None,
+    next_param: str | None = None,
+    items_key: str | None = None,
+    max_pages: int = 100,
+    **kw,
+) -> Iterable[Any]:
+    """Generic JSON paginator. Yields items one by one.
+
+    next_key:   path in response to the next-page cursor/token (e.g. "meta.next").
+    next_param: query param name to send the cursor on the next call.
+    items_key:  path to the list of items (e.g. "data" or "results.items").
+    Set both next_key and next_param for cursor pagination, or override yourself."""
+    params = dict(kw.pop("params", None) or {})
+    for _ in range(max_pages):
+        page = get(url, params=params, **kw)
+        items = _dig(page, items_key) if items_key else page
+        if isinstance(items, list):
+            yield from items
+        else:
+            yield items
+        cursor = _dig(page, next_key) if next_key else None
+        if not cursor or not next_param:
+            return
+        params[next_param] = cursor
+
+
+def _dig(obj: Any, path: str | None) -> Any:
+    if not path:
+        return obj
+    cur = obj
+    for part in path.split("."):
+        if cur is None:
+            return None
+        cur = cur.get(part) if isinstance(cur, dict) else None
+    return cur
+
+
+# --- storage (SQLite) ---
+
+_DB: sqlite3.Connection | None = None
+_DB_PATH: str | None = None
+
+
+def db(path: str | None = None) -> sqlite3.Connection:
+    """Open (or reuse) the SQLite connection. Path resolves to:
+    explicit arg > $AH_DB > ./api-harness.db. Same path returns the same conn."""
+    global _DB, _DB_PATH
+    if path is None:
+        path = os.environ.get("AH_DB", "api-harness.db")
+    if _DB is not None and _DB_PATH == path:
+        return _DB
+    if _DB is not None:
+        _DB.close()
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    _DB = conn
+    _DB_PATH = path
+    return conn
+
+
+def store(table: str, rows: Iterable[dict], *, key: str | tuple[str, ...] | None = None) -> int:
+    """Insert (or upsert) rows into `table`. Creates the table from the first row's keys.
+
+    key: column or tuple of columns to UPSERT on. Omit for plain INSERT.
+    Non-scalar values (dict/list) are JSON-encoded.
+    Returns the number of rows written."""
+    rows = list(rows)
+    if not rows:
+        return 0
+    cols = sorted({k for r in rows for k in r.keys()})
+    conn = db()
+    type_hints = {k: _sql_type(rows[0].get(k)) for k in cols}
+    pk = (key,) if isinstance(key, str) else tuple(key) if key else ()
+    col_defs = ", ".join(
+        f'"{c}" {type_hints[c]}{" PRIMARY KEY" if pk == (c,) else ""}' for c in cols
+    )
+    pk_clause = f', PRIMARY KEY ({", ".join(f"\"{c}\"" for c in pk)})' if len(pk) > 1 else ""
+    conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs}{pk_clause})')
+
+    placeholders = ", ".join("?" for _ in cols)
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    if pk:
+        updates = ", ".join(f'"{c}"=excluded."{c}"' for c in cols if c not in pk)
+        conflict = ", ".join(f'"{c}"' for c in pk)
+        sql = (
+            f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders}) '
+            f'ON CONFLICT ({conflict}) DO UPDATE SET {updates}'
+        )
+    else:
+        sql = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})'
+
+    with conn:
+        conn.executemany(sql, [tuple(_encode(r.get(c)) for c in cols) for r in rows])
+    return len(rows)
+
+
+def q(sql: str, *params: Any) -> list[dict]:
+    """Run a SELECT and return rows as dicts. Use this to inspect / verify."""
+    conn = db()
+    cur = conn.execute(sql, params)
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _sql_type(v: Any) -> str:
+    if isinstance(v, bool):
+        return "INTEGER"
+    if isinstance(v, int):
+        return "INTEGER"
+    if isinstance(v, float):
+        return "REAL"
+    return "TEXT"
+
+
+def _encode(v: Any) -> Any:
+    if isinstance(v, (dict, list)):
+        return json.dumps(v)
+    if isinstance(v, bool):
+        return int(v)
+    return v
+
+
+# --- ingest (docs / SDK) ---
+
+_DOC_EXTS = {".md", ".mdx", ".rst", ".txt", ".html"}
+_CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".go", ".rb", ".java", ".rs", ".kt", ".swift"}
+_SKIP_DIRS = {".git", "node_modules", "dist", "build", "__pycache__", ".venv", "venv", ".tox"}
+
+
+def read_docs(root: str, *, exts: Iterable[str] | None = None, max_bytes: int = 2_000_000) -> dict[str, str]:
+    """Walk `root` and return {relative_path: content} for doc-like files.
+    Skips vendored / build directories. Truncates each file to max_bytes."""
+    return _walk(root, set(exts) if exts else _DOC_EXTS, max_bytes)
+
+
+def read_sdk(root: str, *, exts: Iterable[str] | None = None, max_bytes: int = 2_000_000) -> dict[str, str]:
+    """Walk `root` and return {relative_path: content} for source files.
+    Default extensions cover common SDK languages."""
+    return _walk(root, set(exts) if exts else _CODE_EXTS, max_bytes)
+
+
+def _walk(root: str, exts: set[str], max_bytes: int) -> dict[str, str]:
+    base = Path(root).resolve()
+    out: dict[str, str] = {}
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+        if any(part in _SKIP_DIRS for part in p.parts):
+            continue
+        if p.suffix.lower() not in exts:
+            continue
+        try:
+            data = p.read_bytes()[:max_bytes]
+            out[str(p.relative_to(base))] = data.decode("utf-8", "replace")
+        except OSError:
+            continue
+    return out

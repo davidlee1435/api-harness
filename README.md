@@ -1,66 +1,54 @@
-<img src="https://r2.browser-use.com/github/ajsdlasnnalsgasld.png" alt="Browser Harness" width="100%" />
+# API Harness
 
-# Browser Harness ♞
-
-The simplest, thinnest, **self-healing** harness that gives LLM **complete freedom** to complete any browser task. Built directly on CDP.
-
-The agent writes what's missing, mid-task. No framework, no recipes, no rails. One websocket to Chrome, nothing between.
+The simplest, thinnest harness that lets an agent point at API docs (or an SDK), generate the calls on the fly, and land the response into a queryable SQLite database.
 
 ```
-  ● agent: wants to upload a file
+  ● agent: needs prices from CoinMarketCap
   │
-  ● helpers.py → upload_file() missing
+  ● reads domain-skills/coinmarketcap/  → endpoint, auth, pagination shape
+  ● writes get(...) + store(...)         → helpers.py is enough
   │
-  ● agent edits the harness and writes it    helpers.py   192 → 199 lines
-  │                                                       + upload_file()
-  ✓ file uploaded
+  ✓ data lands in api-harness.db
+  ✓ next agent queries it with `sqlite3 api-harness.db "SELECT ..."`
 ```
 
-**You will never use the browser again.**
+No framework, no rails. Stdlib only. The agent edits the harness — `helpers.py` — when something is missing.
 
 ## Setup prompt
 
 Paste into Claude Code or Codex:
 
 ```text
-Set up https://github.com/browser-use/browser-harness for me.
+Set up https://github.com/davidlee1435/api-harness for me.
 
-Read `install.md` first to install and connect this repo to my real browser. Then read `SKILL.md` for normal usage. Always read `helpers.py` because that is where the functions are. When you open a setup or verification tab, activate it so I can see the active browser tab. After it is installed, open this repository in my browser and, if I am logged in to GitHub, ask me whether you should star it for me as a quick demo that the interaction works — only click the star if I say yes. If I am not logged in, just go to browser-use.com.
+Read `install.md` first to install the harness. Then read `SKILL.md` for normal usage. Always read `helpers.py` because that is where the functions are. Once installed, run `api-harness -c "print(get('https://api.github.com/zen'))"` so we can confirm HTTP works, then `api-harness -c "store('smoke', [{'id': 1, 'msg': 'hello'}], key='id'); print(q('SELECT * FROM smoke'))"` so we confirm storage works. Then ask me which API I want to point it at.
 ```
 
-When this page appears, tick the checkbox so the agent can connect to your browser:
+## How simple is it?
 
-<img src="docs/setup-remote-debugging.png" alt="Remote debugging setup" width="520" style="border-radius: 12px;" />
-
-See [domain-skills/](domain-skills/) for example tasks.
-
-## Free remote browsers
-
-Useful for stealth, sub-agents, or deployment.<br>
-**Free tier: 3 concurrent browsers, proxies, captcha solving, and more. No card required.**
-
-- Grab a key at [cloud.browser-use.com/new-api-key](https://cloud.browser-use.com/new-api-key)
-- Or let the agent sign up itself via [docs.browser-use.com/llms.txt](https://docs.browser-use.com/llms.txt) (setup flow + challenge context included).
-
-## How simple is it? (~592 lines of Python)
-
-- `install.md` — first-time install and browser bootstrap
+- `install.md` — first-time install, env vars, debugging
 - `SKILL.md` — day-to-day usage
-- `run.py` (~36 lines) — runs plain Python with helpers preloaded
-- `helpers.py` (~195 lines) — starting tool calls; the agent edits these
-- `admin.py` + `daemon.py` (~361 lines) — daemon bootstrap plus the CDP websocket and socket bridge
+- `run.py` — runs plain Python with helpers preloaded
+- `helpers.py` — HTTP (`get/post/put/delete`, `paginate`), storage (`db/store/q`), ingestion (`read_docs/read_sdk`). The agent edits these.
+- `domain-skills/<api>/` — per-API maps (auth, endpoints, pagination, gotchas)
+- `interaction-skills/` — generic mechanics (auth flavors, pagination shapes, retries, table design)
+
+## How agents read the data back
+
+The DB is just a file. Anything that speaks SQLite can read it:
+
+```bash
+sqlite3 api-harness.db ".tables"
+sqlite3 api-harness.db "SELECT * FROM <table> LIMIT 10"
+sqlite3 -json api-harness.db "SELECT ... " | jq .
+```
+
+From inside the harness: `api-harness -c "print(q('SELECT ...'))"`.
 
 ## Contributing
 
-PRs and improvements welcome. The best way to help: **contribute a new domain skill** under [domain-skills/](domain-skills/) for a site or task you use often (LinkedIn outreach, ordering on Amazon, filing expenses, etc.). Each skill teaches the agent the selectors, flows, and edge cases it would otherwise have to rediscover.
+PRs welcome — the best way to help is to **add a new domain skill** under [`domain-skills/`](domain-skills/) for an API you use. Each skill teaches the next agent the auth shape, the real rate limits, the field gotchas, and a sane table schema.
 
-- **Skills are written by the harness, not by you.** Just run your task with the agent — when it figures something non-obvious out, it files the skill itself (see [SKILL.md](SKILL.md)). Please don't hand-author skill files; agent-generated ones reflect what actually works in the browser.
-- Open a PR with the generated `domain-skills/<site>/` folder — small and focused is great.
-- Bug fixes, docs tweaks, and helper improvements are equally welcome.
-- Browse existing skills (`github/`, `linkedin/`, `amazon/`, ...) to see the shape.
-
-If you're not sure where to start, open an issue and we'll point you somewhere useful.
-
----
-
-[The Bitter Lesson of Agent Harnesses](https://browser-use.com/posts/bitter-lesson-agent-harnesses) · [Web Agents That Actually Learn](https://browser-use.com/posts/web-agents-that-actually-learn)
+- **Skills are written by the harness, not by hand.** Run your task, and when the agent figures out something non-obvious, it should file the skill itself.
+- Open a PR with the generated `domain-skills/<api>/` folder — small and focused is great.
+- Bug fixes, helper improvements, and new interaction skills are equally welcome.
