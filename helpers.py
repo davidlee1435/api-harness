@@ -214,7 +214,8 @@ def store(table: str, rows: Iterable[dict], *, key: str | tuple[str, ...] | None
     col_defs = ", ".join(
         f'"{c}" {type_hints[c]}{" PRIMARY KEY" if pk == (c,) else ""}' for c in cols
     )
-    pk_clause = f', PRIMARY KEY ({", ".join(f"\"{c}\"" for c in pk)})' if len(pk) > 1 else ""
+    pk_cols = ", ".join('"' + c + '"' for c in pk)
+    pk_clause = f', PRIMARY KEY ({pk_cols})' if len(pk) > 1 else ""
     conn.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs}{pk_clause})')
 
     placeholders = ", ".join("?" for _ in cols)
